@@ -11,6 +11,7 @@ from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from scipy.stats import randint
 import xgboost as xgb
 from sklearn.ensemble import GradientBoostingClassifier
+import time
 
 #prueba
 pd.set_option("display.max_columns", None)
@@ -145,21 +146,30 @@ def main():
 
     # Train Gradient Boosting model
     print("Training Gradient Boosting model...")
-    model = GradientBoostingClassifier(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=5,
-        min_samples_split=50,
-        min_samples_leaf=20,
-        subsample=0.8,
-        random_state=1234,
-        verbose=1
-    )
-    model.fit(X_train, y_train)
+    xgb_params = {'colsample_bytree': 0.75,
+              'gamma': 0.5,
+              'learning_rate': 0.075,
+              'max_depth': 8,
+              'min_child_weight': 1,
+              'n_estimators': 500,
+              'reg_lambda': 0.5,
+              'subsample': 0.75,
+              }
+
+    model = xgb.XGBClassifier(objective = 'binary:logistic',
+                            seed = 1234,
+                            eval_metric = 'auc',
+                            **xgb_params)
+    
+
+
+     
+    
+    model.fit(X_train, y_train, verbose=100, eval_set=[(X_train,y_train), (X_valid, y_valid)])
 
     # Evaluate on validation set
     print("Evaluating on validation set...")
-    y_val_pred = model.predict_proba(X_valid)[:, 1]
+    y_val_pred = model.predict_proba(X_valid)[:, model.classes_==True]
     val_auc = roc_auc_score(y_valid, y_val_pred)
     print(f"  → Validation ROC AUC: {val_auc:.4f}")
 
@@ -173,10 +183,10 @@ def main():
     # Predict on test set
     print("Generating predictions for test set...")
     test_obs_ids = X_test["obs_id"]
-    preds_proba = model.predict_proba(X_test)[:, 1]
+    preds_proba = model.predict_proba(X_test)[:, model.classes_==True]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
-    preds_df.to_csv("modelo_valid_boosting.csv", index=False)
-    print(f"  → Predictions written to 'modelo_valid_boosting.csv'")
+    preds_df.to_csv("modelo_xgboost.csv", index=False)
+    print(f"  → Predictions written to 'modelo_xgboost.csv")
 
     print("=== Pipeline complete ===")
 

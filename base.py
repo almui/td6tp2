@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score,roc_curve
 from scipy.stats import uniform
 from sklearn.model_selection import cross_val_score, KFold, GridSearchCV
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, ParameterSampler
 from scipy.stats import randint
 import xgboost as xgb
 from sklearn.ensemble import GradientBoostingClassifier
@@ -146,20 +146,53 @@ def main():
 
     # Train Gradient Boosting model
     print("Training Gradient Boosting model...")
-    xgb_params = {'colsample_bytree': 0.75,
-              'gamma': 0.5,
-              'learning_rate': 0.075,
-              'max_depth': 8,
-              'min_child_weight': 1,
-              'n_estimators': 500,
-              'reg_lambda': 0.5,
-              'subsample': 0.75,
-              }
 
-    model = xgb.XGBClassifier(objective = 'binary:logistic',
-                            seed = 1234,
-                            eval_metric = 'auc',
-                            **xgb_params)
+    params = {'max_depth': list(range(1, 40)),
+          'learning_rate': uniform(scale = 0.2),
+          'gamma': uniform(scale = 2),
+          'reg_lambda': uniform(scale = 5),        # Parámetro de regularización.
+          'subsample': uniform(0.5, 0.5),          # Entre 0.5 y 1.
+          'min_child_weight': uniform(scale = 5),
+          'colsample_bytree': uniform(0.75, 0.25), # Entre 0.75 y 1.
+          'n_estimators': list(range(1, 1000))
+         }
+    start = time.time()
+    best_score = 0
+    best_estimator = None
+    iterations = 20
+    for g in ParameterSampler(params, n_iter = iterations, random_state = 1234):
+        clf_xgb = xgb.XGBClassifier(objective = 'binary:logistic', seed = 1234, eval_metric = 'auc', **g)
+        clf_xgb.fit(X_train, y_train, eval_set = [(X_valid, y_valid)], verbose = False)
+
+        y_pred = clf_xgb.predict_proba(X_valid)[:, 1] # Obtenemos la probabilidad de una de las clases (cualquiera).
+        auc_roc = roc_auc_score(y_valid, y_pred)
+        # Guardamos si es mejor.
+        if auc_roc > best_score:
+            print(f'Mejor valor de ROC-AUC encontrado: {auc_roc}')
+            best_score = auc_roc
+            best_grid = g
+            model = clf_xgb
+
+    end = time.time()
+    print('ROC-AUC: %0.5f' % best_score)
+    print('Grilla:', best_grid)
+    print(f'Tiempo transcurrido: {str(end - start)} segundos')
+    print(f'Tiempo de entrenamiento por iteración: {str(round((end - start) / iterations, 2))} segundos')
+
+    # xgb_params = {'colsample_bytree': 0.75,
+    #           'gamma': 0.5,
+    #           'learning_rate': 0.075,
+    #           'max_depth': 8,
+    #           'min_child_weight': 1,
+    #           'n_estimators': 500,
+    #           'reg_lambda': 0.5,
+    #           'subsample': 0.75,
+    #           }
+
+    # model = xgb.XGBClassifier(objective = 'binary:logistic',
+    #                         seed = 1234,
+    #                         eval_metric = 'auc',
+    #                         **xgb_params)
      
     model.fit(X_train, y_train, verbose=100, eval_set=[(X_train,y_train), (X_valid, y_valid)])
 
@@ -183,8 +216,8 @@ def main():
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
 
  
-    preds_df.to_csv("modelo_xgboost.csv", index=False)
-    print(f"  → Predictions written to 'modelo_xgboost.csv")
+    preds_df.to_csv("modelo_xgboost_iter.csv", index=False)
+    print(f"  → Predictions written to 'modelo_xgboost_iter.csv")
 
     print("=== Pipeline complete ===")
 

@@ -160,16 +160,12 @@ def main():
                             seed = 1234,
                             eval_metric = 'auc',
                             **xgb_params)
-    
-
-
      
-    
     model.fit(X_train, y_train, verbose=100, eval_set=[(X_train,y_train), (X_valid, y_valid)])
 
     # Evaluate on validation set
     print("Evaluating on validation set...")
-    y_val_pred = model.predict_proba(X_valid)[:, model.classes_==True]
+    y_val_pred = model.predict_proba(X_valid)[:, 1]
     val_auc = roc_auc_score(y_valid, y_val_pred)
     print(f"  → Validation ROC AUC: {val_auc:.4f}")
 
@@ -183,8 +179,10 @@ def main():
     # Predict on test set
     print("Generating predictions for test set...")
     test_obs_ids = X_test["obs_id"]
-    preds_proba = model.predict_proba(X_test)[:, model.classes_==True]
+    preds_proba = model.predict_proba(X_test)[:, 1]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
+
+ 
     preds_df.to_csv("modelo_xgboost.csv", index=False)
     print(f"  → Predictions written to 'modelo_xgboost.csv")
 

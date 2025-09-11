@@ -181,10 +181,7 @@ def main():
     # Split data
     X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
 
-    print(X_train["shuffle"].mean(),  X_valid["shuffle"].mean(), X_test["shuffle"].mean())
-    X_train.to_csv("x_train.csv", index=False)
-    X_valid.to_csv("x_valid.csv", index=False)
-    X_test.to_csv("x_test.csv", index=False)
+  
     # Train Gradient Boosting model
     print("Training XGBoosting model...")
 

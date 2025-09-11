@@ -90,8 +90,9 @@ def split_train_valid_test(df):
     train_valid_df = df[~test_mask]
     n_valid = int(0.1 * len(train_valid_df))
 
-    valid_df = train_valid_df.iloc[-n_valid:]
+
     train_df = train_valid_df.iloc[:-n_valid]
+    valid_df = train_valid_df.iloc[-n_valid:]
     test_df = df[test_mask]
 
     X_train = train_df.drop(columns=["target"])
@@ -109,60 +110,14 @@ def split_train_valid_test(df):
 
     return X_train, y_train, X_valid, y_valid, X_test, y_test
 
-def main():
-    print("=== Starting pipeline ===")
-
-    # Load and preprocess data
-    df = load_competition_datasets(
-        COMPETITION_PATH, sample_frac=0.2, random_state=1234
-    )
-    df = cast_column_types(df)
-
-    # Generate user order column
-    df = df.sort_values(["username", "ts"])
-    df["user_order"] = df.groupby("username", observed=True).cumcount() + 1
-    df = df.sort_values(["obs_id"])
-
-    # Create target and test mask
-    print("Creating 'target' and 'is_test' columns...")
-    df["target"] = (df["reason_end"] == "fwdbtn").astype(int)
-    df["is_test"] = df["reason_end"].isna()
-    df.drop(columns=["reason_end"], inplace=True)
-    print("  → 'target' and 'is_test' created, dropped 'reason_end' column.")
-
-    to_keep = [
-        "obs_id",
-        "target",
-        "is_test",
-        "user_order",
-        "shuffle",
-        "offline",
-        "incognito_mode"
-    ]
-    df = df[to_keep]
-
-    # Split data
-    X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
-
-    # Train Gradient Boosting model
-    print("Training Gradient Boosting model...")
-
-    params = {'max_depth': list(range(1, 40)),
-          'learning_rate': uniform(scale = 0.2),
-          'gamma': uniform(scale = 2),
-          'reg_lambda': uniform(scale = 5),        # Parámetro de regularización.
-          'subsample': uniform(0.5, 0.5),          # Entre 0.5 y 1.
-          'min_child_weight': uniform(scale = 5),
-          'colsample_bytree': uniform(0.75, 0.25), # Entre 0.75 y 1.
-          'n_estimators': list(range(1, 1000))
-         }
+def train_classifier(X_train, y_train,X_valid, y_valid, params=None):
     start = time.time()
     best_score = 0
-    best_estimator = None
+    model = None
     iterations = 20
     for g in ParameterSampler(params, n_iter = iterations, random_state = 1234):
         clf_xgb = xgb.XGBClassifier(objective = 'binary:logistic', seed = 1234, eval_metric = 'auc', **g)
-        clf_xgb.fit(X_train, y_train, eval_set = [(X_valid, y_valid)], verbose = False)
+        clf_xgb.fit(X_train, y_train, verbose=False,eval_set=[(X_valid, y_valid)])
 
         y_pred = clf_xgb.predict_proba(X_valid)[:, 1] # Obtenemos la probabilidad de una de las clases (cualquiera).
         auc_roc = roc_auc_score(y_valid, y_pred)
@@ -178,25 +133,81 @@ def main():
     print('Grilla:', best_grid)
     print(f'Tiempo transcurrido: {str(end - start)} segundos')
     print(f'Tiempo de entrenamiento por iteración: {str(round((end - start) / iterations, 2))} segundos')
+    return model
 
-    # xgb_params = {'colsample_bytree': 0.75,
-    #           'gamma': 0.5,
-    #           'learning_rate': 0.075,
-    #           'max_depth': 8,
-    #           'min_child_weight': 1,
-    #           'n_estimators': 500,
-    #           'reg_lambda': 0.5,
-    #           'subsample': 0.75,
-    #           }
+def category_to_int(df, category):
+    df[f"int_{category}"] = pd.factorize(df[category])[0] + 1
+    return df
 
-    # model = xgb.XGBClassifier(objective = 'binary:logistic',
-    #                         seed = 1234,
-    #                         eval_metric = 'auc',
-    #                         **xgb_params)
-     
-    model.fit(X_train, y_train, verbose=100, eval_set=[(X_train,y_train), (X_valid, y_valid)])
 
-    # Evaluate on validation set
+
+def main():
+    print("=== Starting pipeline ===")
+
+    # Load and preprocess data
+    df = load_competition_datasets(
+        COMPETITION_PATH, sample_frac=1,random_state=1234
+    )
+    df = cast_column_types(df)
+    df = df.sort_values(["obs_id"])
+    df =category_to_int(df, "platform")
+ 
+
+    # Generate user order column
+    df = df.sort_values(["username", "ts"])
+    df["user_order"] = df.groupby("username", observed=True).cumcount() + 1
+    df = df.sort_values(["obs_id"])
+
+
+    # Create target and test mask
+    print("Creating 'target' and 'is_test' columns...")
+    df["target"] = (df["reason_end"] == "fwdbtn").astype(int)
+    df["is_test"] = df["reason_end"].isna()
+    df.drop(columns=["reason_end"], inplace=True)
+    print("  → 'target' and 'is_test' created, dropped 'reason_end' column.")
+
+    to_keep = [
+        "obs_id",
+        "int_platform",
+        "target",
+        "is_test",
+        "user_order",
+        "shuffle",
+        "offline",
+        "incognito_mode"
+    ]
+    df = df[to_keep]
+
+    # Split data
+    X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
+
+    print(X_train["shuffle"].mean(),  X_valid["shuffle"].mean(), X_test["shuffle"].mean())
+    X_train.to_csv("x_train.csv", index=False)
+    X_valid.to_csv("x_valid.csv", index=False)
+    X_test.to_csv("x_test.csv", index=False)
+    # Train Gradient Boosting model
+    print("Training XGBoosting model...")
+
+    params = {'max_depth': list(range(3, 12)),
+          'learning_rate': uniform(scale = 0.2),
+          'gamma': uniform(scale = 2),
+          'reg_lambda': uniform(scale = 5),        # Parámetro de regularización.
+          'subsample': uniform(0.5, 0.5),          # Entre 0.5 y 1.
+          'min_child_weight': uniform(scale = 5),
+          'colsample_bytree': uniform(0.75, 0.25), # Entre 0.75 y 1.
+          'n_estimators': list(range(50, 501, 50))
+         }
+    model = train_classifier(X_train, y_train, X_valid, y_valid, params)
+
+    model.fit(X_train, y_train, verbose=100,eval_set=[(X_valid, y_valid)])
+    # el early_stopping detiene el entrenamiento cuando la validación deja de mejorar
+    
+    # Evaluate on trainig & validation set
+    print("Evaluating on training set...")
+    train_pred = model.predict_proba(X_train)[:, 1]
+    train_auc = roc_auc_score(y_train, train_pred)
+    print(f"  → Trainig ROC AUC: {train_auc:.4f}")
+
     print("Evaluating on validation set...")
     y_val_pred = model.predict_proba(X_valid)[:, 1]
     val_auc = roc_auc_score(y_valid, y_val_pred)
@@ -213,11 +224,9 @@ def main():
     print("Generating predictions for test set...")
     test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
-    preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
-
- 
-    preds_df.to_csv("modelo_xgboost_iter.csv", index=False)
-    print(f"  → Predictions written to 'modelo_xgboost_iter.csv")
+    preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba}) 
+    preds_df.to_csv("modelo_param.csv", index=False)
+    print(f"  → Predictions written to 'modelo_param.csv")
 
     print("=== Pipeline complete ===")
 

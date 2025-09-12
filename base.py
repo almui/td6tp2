@@ -5,7 +5,7 @@ from scipy import sparse
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score,roc_curve
-from scipy.stats import uniform
+from scipy.stats import uniform, randint
 from sklearn.model_selection import cross_val_score, KFold, GridSearchCV
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, ParameterSampler
 from scipy.stats import randint
@@ -82,6 +82,38 @@ def cast_column_types(df):
     print("  → Column types cast successfully.")
     return df
 
+def add_engineered_features(df):
+    # --- 1. Extract OS name from platform ---
+    df["platform_os"] = df["platform"].str.split().str[0]
+
+    # --- 2. Convert ts to local time based on country ---
+    # Define offsets: Argentina ~ UTC-3, US ~ UTC-5 (rough, no DST handling)
+    # You can refine with pytz if exact TZ needed
+    offsets = {"AR": -3, "US": -5}
+
+    df["local_ts"] = df.apply(
+        lambda row: row["ts"] + pd.Timedelta(hours=offsets.get(row["conn_country"], 0)),
+        axis=1,
+    )
+
+    # --- 3. Create time-of-day categories ---
+    def categorize_hour(hour):
+        if 6 <= hour < 12:
+            return "morning"
+        elif 12 <= hour < 15:
+            return "noon"
+        elif 15 <= hour < 21:
+            return "afternoon"
+        else:
+            return "night"
+
+    df["time_of_day"] = df["local_ts"].dt.hour.map(categorize_hour)
+
+    # --- 4. Encode to int for model ---
+    df = category_to_int(df, "platform_os")
+    df = category_to_int(df, "time_of_day")
+
+    return df
 
 def split_train_valid_test(df):
     """
@@ -142,6 +174,26 @@ def category_to_int(df, category):
     df[f"int_{category}"] = pd.factorize(df[category])[0] + 1
     return df
 
+def add_user_daytime_counts(df):
+    # Contar escuchas por usuario y franja horaria
+    user_day_counts = (
+        df.groupby(["username", "time_of_day"])
+          .size()
+          .reset_index(name="count")
+    )
+
+    # Pivot: columnas = franjas, filas = usuarios
+    user_day_counts = user_day_counts.pivot(
+        index="username", columns="time_of_day", values="count"
+    ).fillna(0)
+
+    # Renombrar columnas para claridad
+    user_day_counts = user_day_counts.add_prefix("count_").reset_index()
+
+    # Merge back al df original
+    df = df.merge(user_day_counts, on="username", how="left")
+
+    return df
 
 
 def main():
@@ -158,8 +210,8 @@ def main():
     df = category_to_int(df, "master_metadata_track_name")
     df =category_to_int(df, "platform")
     df =category_to_int(df, "username")
- 
-
+    df = add_engineered_features(df)
+    df = add_user_daytime_counts(df)
     # Generate user order column
     df = df.sort_values(["username", "ts"])
     df["user_order"] = df.groupby("username", observed=True).cumcount() + 1
@@ -176,6 +228,8 @@ def main():
     to_keep = [
         "obs_id",
         "int_platform",
+        "int_platform_os",        
+        "int_time_of_day",      
         "int_master_metadata_track_name",
         "int_master_metadata_album_artist_name",
         "int_master_metadata_album_album_name",
@@ -185,7 +239,11 @@ def main():
         "shuffle",
         "offline",
         "incognito_mode",
-        "int_username"
+        "int_username",
+        "count_morning",
+        "count_noon",
+        "count_afternoon",
+        "count_night",
     ]
     df = df[to_keep]
 
@@ -196,15 +254,16 @@ def main():
     # Train Gradient Boosting model
     print("Training XGBoosting model...")
 
-    params = {'max_depth': list(range(3, 12)),
-          'learning_rate': uniform(scale = 0.2),
-          'gamma': uniform(scale = 2),
-          'reg_lambda': uniform(scale = 5),        # Parámetro de regularización.
-          'subsample': uniform(0.5, 0.5),          # Entre 0.5 y 1.
-          'min_child_weight': uniform(scale = 5),
-          'colsample_bytree': uniform(0.75, 0.25), # Entre 0.75 y 1.
-          'n_estimators': list(range(50, 501, 50))
-         }
+    params = {
+        "max_depth": list(range(2, 16)),                # allow shallower + deeper trees
+        "learning_rate": uniform(0.01, 0.3),            # [0.01, 0.31] slower to faster learning
+        "gamma": uniform(0, 10),                        # [0, 10]
+        "reg_lambda": uniform(0, 20),                   # stronger regularization range
+        "subsample": uniform(0.3, 0.7),                 # [0.3, 1.0]
+        "min_child_weight": randint(1, 15),             # integer, 1–15
+        "colsample_bytree": uniform(0.3, 0.7),          # [0.3, 1.0]
+        "n_estimators": list(range(50, 1001, 50))       # 50 up to 1000
+    }
     model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
     model.fit(X_train, y_train, verbose=100,eval_set=[(X_valid, y_valid)])

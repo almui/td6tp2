@@ -75,6 +75,9 @@ def cast_column_types(df):
     df["offline_timestamp"] = pd.to_datetime(
         df["offline_timestamp"], unit="s", errors="coerce", utc=True
     )
+    # df['tp_local'] = df['ts'].dt.tz_convert('Europe/Madrid')
+    # print("\nFechas convertidas a Madrid:")
+    # print(df['timestamp_madrid'])
     df = df.astype(dtype_map)
     print("  → Column types cast successfully.")
     return df
@@ -150,7 +153,11 @@ def main():
     )
     df = cast_column_types(df)
     df = df.sort_values(["obs_id"])
+    df = category_to_int(df, "master_metadata_album_album_name")
+    df = category_to_int(df, "master_metadata_album_artist_name")
+    df = category_to_int(df, "master_metadata_track_name")
     df =category_to_int(df, "platform")
+    df =category_to_int(df, "username")
  
 
     # Generate user order column
@@ -169,12 +176,16 @@ def main():
     to_keep = [
         "obs_id",
         "int_platform",
+        "int_master_metadata_track_name",
+        "int_master_metadata_album_artist_name",
+        "int_master_metadata_album_album_name",
         "target",
         "is_test",
         "user_order",
         "shuffle",
         "offline",
-        "incognito_mode"
+        "incognito_mode",
+        "int_username"
     ]
     df = df[to_keep]
 
@@ -197,8 +208,7 @@ def main():
     model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
     model.fit(X_train, y_train, verbose=100,eval_set=[(X_valid, y_valid)])
-    # el early_stopping detiene el entrenamiento cuando la validación deja de mejorar
-    
+ 
     # Evaluate on trainig & validation set
     print("Evaluating on training set...")
     train_pred = model.predict_proba(X_train)[:, 1]
@@ -222,8 +232,8 @@ def main():
     test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba}) 
-    preds_df.to_csv("modelo_param.csv", index=False)
-    print(f"  → Predictions written to 'modelo_param.csv")
+    preds_df.to_csv("modelo_masvariables.csv", index=False)
+    print(f"  → Predictions written to 'modelo_masvariables.csv")
 
     print("=== Pipeline complete ===")
 

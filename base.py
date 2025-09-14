@@ -1,52 +1,36 @@
 import os
 import pandas as pd
 import numpy as np
-from scipy import sparse
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score,roc_curve
 from scipy.stats import uniform, randint
-from sklearn.model_selection import cross_val_score, KFold, GridSearchCV
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, ParameterSampler
-from scipy.stats import randint
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import ParameterSampler
 import xgboost as xgb
-from sklearn.ensemble import GradientBoostingClassifier
 import time
 
-#prueba
 pd.set_option("display.max_columns", None)
- 
-# Adjust this path if needed
+
 COMPETITION_PATH = "."
 
+# =========================
+# Loaders & Preprocessing
+# =========================
 
 def load_competition_datasets(data_dir, sample_frac=None, random_state=None):
-    """
-    Load train and test datasets, optionally sample a fraction of the training set,
-    concatenate, and reset index.
-    """
     print("Loading competition datasets from:", data_dir)
     train_file = os.path.join(data_dir, "competition_data/train_data.txt")
     test_file = os.path.join(data_dir, "competition_data/test_data.txt")
 
-    # Load training data and optionally subsample
     train_df = pd.read_csv(train_file, sep="\t", low_memory=False)
     if sample_frac is not None:
         train_df = train_df.sample(frac=sample_frac, random_state=random_state)
 
-    # Load test data
     test_df = pd.read_csv(test_file, sep="\t", low_memory=False)
 
-    # Concatenate and reset index
     combined = pd.concat([train_df, test_df], ignore_index=True)
     print(f"  → Concatenated DataFrame: {combined.shape[0]} rows")
     return combined
 
-
 def cast_column_types(df):
-    """
-    Cast columns to efficient dtypes and parse datetime fields.
-    """
     print("Casting column types and parsing datetime fields...")
     dtype_map = {
         "platform": "category",
@@ -75,28 +59,30 @@ def cast_column_types(df):
     df["offline_timestamp"] = pd.to_datetime(
         df["offline_timestamp"], unit="s", errors="coerce", utc=True
     )
-    # df['tp_local'] = df['ts'].dt.tz_convert('Europe/Madrid')
-    # print("\nFechas convertidas a Madrid:")
-    # print(df['timestamp_madrid'])
     df = df.astype(dtype_map)
     print("  → Column types cast successfully.")
     return df
 
+# =========================
+# Feature Engineering
+# =========================
+
+def category_to_int(df, category):
+    df[f"int_{category}"] = pd.factorize(df[category])[0] + 1
+    return df
+
 def add_engineered_features(df):
-    # --- 1. Extract OS name from platform ---
+    # --- OS name ---
     df["platform_os"] = df["platform"].str.split().str[0]
 
-    # --- 2. Convert ts to local time based on country ---
-    # Define offsets: Argentina ~ UTC-3, US ~ UTC-5 (rough, no DST handling)
-    # You can refine with pytz if exact TZ needed
+    # --- Local time ---
     offsets = {"AR": -3, "US": -5}
-
     df["local_ts"] = df.apply(
         lambda row: row["ts"] + pd.Timedelta(hours=offsets.get(row["conn_country"], 0)),
         axis=1,
     )
 
-    # --- 3. Create time-of-day categories ---
+    # --- Time of day categories ---
     def categorize_hour(hour):
         if 6 <= hour < 12:
             return "morning"
@@ -108,23 +94,68 @@ def add_engineered_features(df):
             return "night"
 
     df["time_of_day"] = df["local_ts"].dt.hour.map(categorize_hour)
-
-    # --- 4. Encode to int for model ---
     df = category_to_int(df, "platform_os")
     df = category_to_int(df, "time_of_day")
 
+    # --- Temporal dynamics ---
+    df["day_of_week"] = df["local_ts"].dt.dayofweek
+    df["hour"] = df["local_ts"].dt.hour
+
     return df
 
-def split_train_valid_test(df):
-    """
-    Split features and labels into train/valid/test based on masks.
-    """
-    print("Splitting data into train/valid/test sets...")
+def add_user_daytime_counts(df):
+    user_day_counts = (
+        df.groupby(["username", "time_of_day"]).size().reset_index(name="count")
+    )
+    user_day_counts = user_day_counts.pivot(
+        index="username", columns="time_of_day", values="count"
+    ).fillna(0)
+    user_day_counts = user_day_counts.add_prefix("count_").reset_index()
+    df = df.merge(user_day_counts, on="username", how="left")
+    return df
 
+def add_session_features(df):
+    df = df.sort_values(["username", "ts"])
+    df["ts_diff"] = df.groupby("username")["ts"].diff().dt.total_seconds().fillna(0)
+    df["new_session"] = (df["ts_diff"] > 1800).astype(int)
+    df["session_id"] = df.groupby("username")["new_session"].cumsum()
+    df["session_pos"] = df.groupby(["username", "session_id"]).cumcount() + 1
+    df["session_len"] = df.groupby(["username", "session_id"])["obs_id"].transform("count")
+    return df
+
+def add_repetition_features(df):
+    df = df.sort_values(["username", "ts"])
+    df["user_track_count"] = df.groupby(["username", "int_master_metadata_track_name"]).cumcount()
+    df["user_artist_count"] = df.groupby(["username", "int_master_metadata_album_artist_name"]).cumcount()
+    return df
+
+def add_skip_history(df: pd.DataFrame) -> pd.DataFrame:
+    # User’s rolling skip rate up to the current observation
+    df["user_skip_rate"] = (
+        df.groupby("username")["target"]
+          .transform(lambda x: x.shift().expanding().mean())
+    )
+    
+    # Fill NaN for first observation
+    df["user_skip_rate"] = df["user_skip_rate"].fillna(0.0)
+
+    # Recent skip streak: last N plays skipped (e.g., 3)
+    df["user_recent_skip_sum"] = (
+        df.groupby("username")["target"]
+          .transform(lambda x: x.shift().rolling(3, min_periods=1).sum())
+    )
+
+    return df
+
+# =========================
+# Train / Eval
+# =========================
+
+def split_train_valid_test(df):
+    print("Splitting data into train/valid/test sets...")
     test_mask = df["is_test"].to_numpy()
     train_valid_df = df[~test_mask]
     n_valid = int(0.1 * len(train_valid_df))
-
 
     train_df = train_valid_df.iloc[:-n_valid]
     valid_df = train_valid_df.iloc[-n_valid:]
@@ -132,31 +163,30 @@ def split_train_valid_test(df):
 
     X_train = train_df.drop(columns=["target"])
     y_train = train_df["target"].to_numpy()
-
     X_valid = valid_df.drop(columns=["target"])
     y_valid = valid_df["target"].to_numpy()
-
     X_test = test_df.drop(columns=["target"])
     y_test = test_df["target"].to_numpy()
 
     print(f"→ Train: {X_train.shape[0]} filas")
-    print(f"→ Valid: {X_valid.shape[0]} filas ({0.1*100:.0f}% del train)")
+    print(f"→ Valid: {X_valid.shape[0]} filas")
     print(f"→ Test:  {X_test.shape[0]} filas")
 
     return X_train, y_train, X_valid, y_valid, X_test, y_test
 
-def train_classifier(X_train, y_train,X_valid, y_valid, params=None):
+def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
     start = time.time()
     best_score = 0
     model = None
     iterations = 20
-    for g in ParameterSampler(params, n_iter = iterations, random_state = 1234):
-        clf_xgb = xgb.XGBClassifier(objective = 'binary:logistic', seed = 1234, eval_metric = 'auc', **g)
-        clf_xgb.fit(X_train, y_train, verbose=False,eval_set=[(X_valid, y_valid)])
+    for g in ParameterSampler(params, n_iter=iterations, random_state=1234):
+        clf_xgb = xgb.XGBClassifier(
+            objective="binary:logistic", seed=1234, eval_metric="auc", **g
+        )
+        clf_xgb.fit(X_train, y_train, verbose=False, eval_set=[(X_valid, y_valid)])
 
-        y_pred = clf_xgb.predict_proba(X_valid)[:, 1] # Obtenemos la probabilidad de una de las clases (cualquiera).
+        y_pred = clf_xgb.predict_proba(X_valid)[:, 1]
         auc_roc = roc_auc_score(y_valid, y_pred)
-        # Guardamos si es mejor.
         if auc_roc > best_score:
             print(f'Mejor valor de ROC-AUC encontrado: {auc_roc}')
             best_score = auc_roc
@@ -170,129 +200,95 @@ def train_classifier(X_train, y_train,X_valid, y_valid, params=None):
     print(f'Tiempo de entrenamiento por iteración: {str(round((end - start) / iterations, 2))} segundos')
     return model
 
-def category_to_int(df, category):
-    df[f"int_{category}"] = pd.factorize(df[category])[0] + 1
-    return df
-
-def add_user_daytime_counts(df):
-    # Contar escuchas por usuario y franja horaria
-    user_day_counts = (
-        df.groupby(["username", "time_of_day"])
-          .size()
-          .reset_index(name="count")
-    )
-
-    # Pivot: columnas = franjas, filas = usuarios
-    user_day_counts = user_day_counts.pivot(
-        index="username", columns="time_of_day", values="count"
-    ).fillna(0)
-
-    # Renombrar columnas para claridad
-    user_day_counts = user_day_counts.add_prefix("count_").reset_index()
-
-    # Merge back al df original
-    df = df.merge(user_day_counts, on="username", how="left")
-
-    return df
-
+# =========================
+# Main
+# =========================
 
 def main():
     print("=== Starting pipeline ===")
-
-    # Load and preprocess data
-    df = load_competition_datasets(
-        COMPETITION_PATH, sample_frac=1,random_state=1234
-    )
+    df = load_competition_datasets(COMPETITION_PATH, sample_frac=1, random_state=1234)
     df = cast_column_types(df)
     df = df.sort_values(["obs_id"])
+
+    # Basic encodings
     df = category_to_int(df, "master_metadata_album_album_name")
     df = category_to_int(df, "master_metadata_album_artist_name")
     df = category_to_int(df, "master_metadata_track_name")
-    df =category_to_int(df, "platform")
-    df =category_to_int(df, "username")
+    df = category_to_int(df, "platform")
+    df = category_to_int(df, "username")
+
+    # Feature engineering
     df = add_engineered_features(df)
     df = add_user_daytime_counts(df)
-    # Generate user order column
-    df = df.sort_values(["username", "ts"])
-    df["user_order"] = df.groupby("username", observed=True).cumcount() + 1
-    df = df.sort_values(["obs_id"])
 
-
-    # Create target and test mask
+    # Create target/test
     print("Creating 'target' and 'is_test' columns...")
     df["target"] = (df["reason_end"] == "fwdbtn").astype(int)
     df["is_test"] = df["reason_end"].isna()
     df.drop(columns=["reason_end"], inplace=True)
     print("  → 'target' and 'is_test' created, dropped 'reason_end' column.")
 
+    # Session + repetition + temporal + skip history
+    df = add_session_features(df)
+    df = add_repetition_features(df)
+    df = add_skip_history(df)
+
+    # Columns to keep
     to_keep = [
-        "obs_id",
-        "int_platform",
-        "int_platform_os",        
-        "int_time_of_day",      
-        "int_master_metadata_track_name",
-        "int_master_metadata_album_artist_name",
-        "int_master_metadata_album_album_name",
-        "target",
-        "is_test",
-        "user_order",
-        "shuffle",
-        "offline",
-        "incognito_mode",
-        "int_username",
-        "count_morning",
-        "count_noon",
-        "count_afternoon",
-        "count_night",
+        "obs_id", "int_platform", "int_platform_os", "int_time_of_day",
+        "int_master_metadata_track_name", "int_master_metadata_album_artist_name",
+        "int_master_metadata_album_album_name", "target", "is_test",
+        "shuffle", "offline", "incognito_mode", "int_username",
+        "count_morning", "count_noon", "count_afternoon", "count_night",
+        "day_of_week", "hour",
+        "ts_diff", "session_pos", "session_len",
+        "user_track_count", "user_artist_count", "user_skip_rate"
     ]
     df = df[to_keep]
 
-    # Split data
+    # Split
     X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
 
-  
-    # Train Gradient Boosting model
+    # Train model
     print("Training XGBoosting model...")
-
     params = {
-        "max_depth": list(range(2, 16)),                # allow shallower + deeper trees
-        "learning_rate": uniform(0.01, 0.3),            # [0.01, 0.31] slower to faster learning
-        "gamma": uniform(0, 10),                        # [0, 10]
-        "reg_lambda": uniform(0, 20),                   # stronger regularization range
-        "subsample": uniform(0.3, 0.7),                 # [0.3, 1.0]
-        "min_child_weight": randint(1, 15),             # integer, 1–15
-        "colsample_bytree": uniform(0.3, 0.7),          # [0.3, 1.0]
-        "n_estimators": list(range(50, 1001, 50))       # 50 up to 1000
+        "max_depth": list(range(2, 16)),
+        "learning_rate": uniform(0.01, 0.3),
+        "gamma": uniform(0, 10),
+        "reg_lambda": uniform(0, 20),
+        "subsample": uniform(0.3, 0.7),
+        "min_child_weight": randint(1, 15),
+        "colsample_bytree": uniform(0.3, 0.7),
+        "n_estimators": list(range(50, 1001, 50))
     }
     model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
-    model.fit(X_train, y_train, verbose=100,eval_set=[(X_valid, y_valid)])
- 
-    # Evaluate on trainig & validation set
+    model.fit(X_train, y_train, verbose=100, eval_set=[(X_valid, y_valid)])
+
     print("Evaluating on training set...")
     train_pred = model.predict_proba(X_train)[:, 1]
     train_auc = roc_auc_score(y_train, train_pred)
-    print(f"  → Trainig ROC AUC: {train_auc:.4f}")
+    print(f"  → Training ROC AUC: {train_auc:.4f}")
 
     print("Evaluating on validation set...")
     y_val_pred = model.predict_proba(X_valid)[:, 1]
     val_auc = roc_auc_score(y_valid, y_val_pred)
     print(f"  → Validation ROC AUC: {val_auc:.4f}")
 
-    # Feature importances
+    # Importances
     importances = model.feature_importances_
     imp_series = pd.Series(importances, index=X_train.columns)
     imp_sorted = imp_series.sort_values(ascending=False)
     print("\nTop 20 feature importances:")
     print(imp_sorted.head(20))
 
-    # Predict on test set
+    # Predictions
     print("Generating predictions for test set...")
     test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
-    preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba}) 
+    preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
     preds_df.to_csv("modelo_masvariables.csv", index=False)
-    print(f"  → Predictions written to 'modelo_masvariables.csv")
+    print("  → Predictions written to 'modelo_masvariables.csv'")
 
     print("=== Pipeline complete ===")
 

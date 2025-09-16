@@ -252,14 +252,15 @@ def main():
     # Train model
     print("Training XGBoosting model...")
     params = {
-        "max_depth": list(range(2, 16)),
-        "learning_rate": uniform(0.01, 0.3),
-        "gamma": uniform(0, 10),
-        "reg_lambda": uniform(0, 20),
-        "subsample": uniform(0.3, 0.7),
-        "min_child_weight": randint(1, 15),
-        "colsample_bytree": uniform(0.3, 0.7),
-        "n_estimators": list(range(50, 1001, 50))
+        "max_depth": list(range(3, 10)),
+        "learning_rate": uniform(0.01, 0.2),
+        "subsample": uniform(0.5, 0.5),        # <= más bajo, más robusto
+        "colsample_bytree": uniform(0.5, 0.5), # <= más bajo, más robusto
+        "min_child_weight": randint(5, 20),    # evita sobreajuste a outliers
+        "gamma": uniform(0, 5),
+        "reg_lambda": uniform(5, 20),          # más regularización L2
+        "reg_alpha": uniform(0, 5),            # agregá regularización L1
+        "n_estimators": list(range(200, 1001, 100))
     }
     model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
@@ -287,7 +288,7 @@ def main():
     test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
-    preds_df.to_csv("modelo_masvariables.csv", index=False)
+    preds_df.to_csv("modelo_masvariables2.csv", index=False)
     print("  → Predictions written to 'modelo_masvariables.csv'")
 
     print("=== Pipeline complete ===")

@@ -1,4 +1,6 @@
 import os
+import json
+import random
 import pandas as pd
 import numpy as np
 from scipy.stats import uniform, randint
@@ -6,6 +8,10 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import ParameterSampler
 import xgboost as xgb
 import time
+from sklearn.preprocessing import OneHotEncoder
+import xgboost as xgb
+import time
+from hyperopt import fmin, tpe, hp, STATUS_OK
 
 pd.set_option("display.max_columns", None)
 
@@ -15,7 +21,7 @@ COMPETITION_PATH = "."
 # Loaders & Preprocessing
 # =========================
 
-def load_competition_datasets(data_dir, sample_frac=None, random_state=None):
+def load_competition_datasets(data_dir, sample_frac=None, random_state=None, max_files=None):
     print("Loading competition datasets from:", data_dir)
     train_file = os.path.join(data_dir, "competition_data/train_data.txt")
     test_file = os.path.join(data_dir, "competition_data/test_data.txt")
@@ -28,9 +34,38 @@ def load_competition_datasets(data_dir, sample_frac=None, random_state=None):
 
     combined = pd.concat([train_df, test_df], ignore_index=True)
     print(f"  → Concatenated DataFrame: {combined.shape[0]} rows")
-    return combined
+    lista_track, lista_episode = [], []
 
-def cast_column_types(df):
+    api_dir = os.path.join(data_dir, "competition_data/spotify_api_data")
+    archivos = os.listdir(api_dir)
+
+    if max_files:
+        max_files = min(max_files, len(archivos))  # por si pones un número mayor al total
+        print(f"Loading {max_files/len(archivos)}% of the Spotify API data")
+        random.seed(random_state)
+        archivos = random.sample(archivos, max_files)
+
+    for i, nombre_archivo in enumerate(archivos, 1):
+        ruta_archivo = os.path.join(api_dir, nombre_archivo)
+        if not (nombre_archivo.startswith('spotify_track') or nombre_archivo.startswith('spotify_episode')):
+            continue
+
+        with open(ruta_archivo, 'r') as f:
+            datos_json = json.load(f)
+
+        df = pd.json_normalize(datos_json, sep='.')
+        if nombre_archivo.startswith('spotify_track'):
+            lista_track.append(df)
+        else:
+            lista_episode.append(df)
+
+        print(f"[{i}/{len(archivos)}] Loaded {nombre_archivo}")
+
+    df_track = pd.concat(lista_track, ignore_index=True) if lista_track else pd.DataFrame()
+    df_episode = pd.concat(lista_episode, ignore_index=True) if lista_episode else pd.DataFrame()
+    return combined, df_track, df_episode
+
+def cast_column_types(df, df_t, df_e):
     print("Casting column types and parsing datetime fields...")
     dtype_map = {
         "platform": "category",
@@ -60,8 +95,75 @@ def cast_column_types(df):
         df["offline_timestamp"], unit="s", errors="coerce", utc=True
     )
     df = df.astype(dtype_map)
+    # ---Tracks---
+    columnas_a_eliminar_t = [
+        "href", "id", "uri", "preview_url", "type",
+        "album.external_urls.spotify", "album.href", "album.id",
+        "album.images", "album.uri",
+        "external_ids.isrc", "external_urls.spotify", "album.artists", "artists"
+    ]
+    df_t = df_t.drop(columnas_a_eliminar_t, errors="ignore", axis=1)
+
+    dtype_map_t = {
+        "name": "category",
+        "album.name": "category",
+        "album.album_type": "category",
+        "album.total_tracks": int,
+        "album.type": "category",
+        "album.release_date_precision": "category",
+        "explicit": bool,
+        "is_local": bool,
+        "duration_ms": int,
+        "disc_number": int,
+        "track_number": int,
+        "popularity": int,
+        "external_ids.isrc": "string",
+        "album.release_date": "string",
+        "album.available_markets": "string",
+        "available_markets": "string"
+    }
+
+    # Aplicás tipos sin iterar uno por uno
+    for col, dtype in dtype_map_t.items():
+        if col in df_t.columns:
+            df_t[col] = df_t[col].astype(dtype)
+
+    # ---Episodes---
+    columnas_a_eliminar_e = [
+        "href", "id", "uri", "external_urls.spotify",
+        "show.external_urls.spotify", "show.href", "show.id",
+        "show.images", "audio_preview_url", "show.uri", "show.html_description", "show.description",
+        "show.copyrights", "html_description", "description", "images"
+    ]
+    df_e = df_e.drop(columns=columnas_a_eliminar_e, errors="ignore", axis=1)
+    dtype_map_e = {
+        "name": "category",
+        "language": "category",
+        "languages": "string",
+        "release_date": "string",
+        "release_date_precision": "category",
+        "explicit": bool,
+        "is_externally_hosted": bool,
+        "is_playable": bool,
+        "duration_ms": int,
+        "show.name": "category",
+        "show.publisher": "category",
+        "show.type": "category",
+        "show.total_episodes": int,
+        "show.media_type": "category",
+        "show.languages": "string",
+        "show.is_externally_hosted ": bool,
+        "show.explicit": bool,
+        "show.available_markets": "string",
+        "type": "category"
+    }
+
+    for col, dtype in dtype_map_e.items():
+        if col in df_e.columns:
+            df_e[col] = df_e[col].astype(dtype)
     print("  → Column types cast successfully.")
-    return df
+
+    return df, df_t, df_e
 
 # =========================
 # Feature Engineering
@@ -71,12 +173,29 @@ def category_to_int(df, category):
     df[f"int_{category}"] = pd.factorize(df[category])[0] + 1
     return df
 
+def one_hot_encoding(df, category):
+    encoder = OneHotEncoder(sparse_output=False, dtype = int)
+    one_hot_encoded = encoder.fit_transform(df[[category]])
+    one_hot_df = pd.DataFrame(one_hot_encoded, columns=encoder.get_feature_names_out([category]))
+    df = pd.concat([df, one_hot_df], axis=1)
+
+    nuevas_variables = one_hot_df.columns.tolist()
+
+    return df, nuevas_variables
 def add_engineered_features(df):
     # --- OS name ---
-    df["platform_os"] = df["platform"].str.split().str[0]
+    df["platform_os"] = df["platform"].str.split().str[0].str.lower()
+    df["platform_os"] = df["platform_os"].str.replace("webplayer", "web_player")
 
     # --- Local time ---
-    offsets = {"AR": -3, "US": -5}
+    offsets = {
+        "AR": -3, "ES": 1, "CL": -3, "NL": 1, "BE": 1, "DE": 1, "CZ": 1, "LT": 2,
+        "LV": 2, "EE": 2, "IE": 0, "GB": 0, "BR": -3, "FR": 1, "ZZ": 0, "US": -5,
+        "PY": -4, "UY": -3, "CO": -5, "CR": -6, "GR": 2, "FI": 2, "ZA": 2, "DK": 1,
+        "RU": 3, "AT": 1, "JM": -5, "MT": 1, "IT": 1, "AU": 10, "SK": 1, "RO": 2,
+        "GE": 4, "LU": 1, "SG": 8, "AL": 1, "CH": 1, "TW": 8, "HR": 1, "BG": 2,
+        "PE": -5, "PA": -5, "MX": -6, "NO": 1,
+    }
     df["local_ts"] = df.apply(
         lambda row: row["ts"] + pd.Timedelta(hours=offsets.get(row["conn_country"], 0)),
         axis=1,
@@ -88,20 +207,22 @@ def add_engineered_features(df):
             return "morning"
         elif 12 <= hour < 15:
             return "noon"
-        elif 15 <= hour < 21:
+        elif 15 <= hour < 20:
             return "afternoon"
         else:
             return "night"
 
     df["time_of_day"] = df["local_ts"].dt.hour.map(categorize_hour)
-    df = category_to_int(df, "platform_os")
+    df, plataformas = one_hot_encoding(df, "platform_os")
     df = category_to_int(df, "time_of_day")
 
     # --- Temporal dynamics ---
     df["day_of_week"] = df["local_ts"].dt.dayofweek
     df["hour"] = df["local_ts"].dt.hour
+    df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
 
-    return df
+    return df, plataformas
+
 
 def add_user_daytime_counts(df):
     user_day_counts = (
@@ -175,30 +296,66 @@ def split_train_valid_test(df):
     return X_train, y_train, X_valid, y_valid, X_test, y_test
 
 def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
-    start = time.time()
-    best_score = 0
-    model = None
-    iterations = 20
-    for g in ParameterSampler(params, n_iter=iterations, random_state=1234):
-        clf_xgb = xgb.XGBClassifier(
-            objective="binary:logistic", seed=1234, eval_metric="auc", **g
+    def objective(params):
+        # Convertir a enteros si es necesario
+        params['max_depth'] = int(params['max_depth'])
+        params['min_child_weight'] = int(params['min_child_weight'])
+        params['n_estimators'] = int(params['n_estimators'])
+        clf = xgb.XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="auc",
+            seed=1234,
+            **params
         )
-        clf_xgb.fit(X_train, y_train, verbose=False, eval_set=[(X_valid, y_valid)])
+        clf.fit(
+            X_train, y_train,
+            eval_set=[(X_valid, y_valid)],
+            verbose=False
+        )
+        y_pred = clf.predict_proba(X_valid)[:, 1]
+        auc = roc_auc_score(y_valid, y_pred)
+        return {'loss': -auc, 'status': STATUS_OK}
+    
 
-        y_pred = clf_xgb.predict_proba(X_valid)[:, 1]
-        auc_roc = roc_auc_score(y_valid, y_pred)
-        if auc_roc > best_score:
-            print(f'Mejor valor de ROC-AUC encontrado: {auc_roc}')
-            best_score = auc_roc
-            best_grid = g
-            model = clf_xgb
+    start = time.time()
+    best = fmin(
+        fn=objective,
+        space=params,
+        algo=tpe.suggest,
+        max_evals=30,
+        rstate=np.random.default_rng(1234)  # semilla reproducible
+    )
+    final_params = {
+        "max_depth": int(best["max_depth"]),
+        "learning_rate": best["learning_rate"],
+        "subsample": best["subsample"],
+        "colsample_bytree": best["colsample_bytree"],
+        "min_child_weight": int(best["min_child_weight"]),
+        "gamma": best["gamma"],
+        "reg_lambda": best["reg_lambda"],
+        "reg_alpha": best["reg_alpha"],
+        "n_estimators": int(best["n_estimators"])
+    }
 
     end = time.time()
-    print('ROC-AUC: %0.5f' % best_score)
-    print('Grilla:', best_grid)
+    
+    print('Grilla:', final_params)
     print(f'Tiempo transcurrido: {str(end - start)} segundos')
-    print(f'Tiempo de entrenamiento por iteración: {str(round((end - start) / iterations, 2))} segundos')
-    return model
+    best_model = xgb.XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",
+        seed=1234,
+        **final_params
+    )
+    best_model.fit(
+            X_train, y_train,
+            eval_set=[(X_valid, y_valid)],
+            verbose=False, early_stopping_rounds=10
+        )
+    y_pred = best_model.predict_proba(X_valid)[:, 1]
+    best_score= roc_auc_score(y_valid, y_pred)
+    print('ROC-AUC: %0.5f' % best_score)
+    return best_model
 
 # =========================
 # Main
@@ -206,9 +363,31 @@ def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
 
 def main():
     print("=== Starting pipeline ===")
-    df = load_competition_datasets(COMPETITION_PATH, sample_frac=1, random_state=1234)
-    df = cast_column_types(df)
+    df, df_t, df_s = load_competition_datasets(COMPETITION_PATH, sample_frac=1, random_state=1234, max_files=20500)
+    df, df_t, df_s = cast_column_types(df, df_t, df_s)
     df = df.sort_values(["obs_id"])
+
+    df_t = df_t.rename(columns={'name': 'master_metadata_track_name'})
+    df_s = df_s.rename(columns={'name': 'episode_name'})
+
+    print(df_t.info(memory_usage='deep'))
+    print(df_s.info(memory_usage='deep'))
+    
+    df_t = df_t.drop_duplicates(subset=["master_metadata_track_name"])
+    df_s = df_s.drop_duplicates(subset=["episode_name"])
+
+
+    df = df.merge(df_t, on="master_metadata_track_name", how="left", suffixes=("", "_track"))
+    df = df.merge(df_s, on="episode_name", how="left", suffixes=("", "_episode"))
+    for col in ["explicit", "duration_ms"]:
+        track_col = f"{col}_track"
+        episode_col = f"{col}_episode"
+        if track_col in df.columns or episode_col in df.columns:
+            df[col] = df.get(track_col, df.get(episode_col))
+            df[col] = df[col].combine_first(df.get(episode_col))
+        df = df.drop(columns=[c for c in [track_col, episode_col] if c in df.columns])
+    
+
 
     # Basic encodings
     df = category_to_int(df, "master_metadata_album_album_name")
@@ -216,15 +395,29 @@ def main():
     df = category_to_int(df, "master_metadata_track_name")
     df = category_to_int(df, "platform")
     df = category_to_int(df, "username")
+    df = category_to_int(df, "episode_name")
+    df = category_to_int(df, "episode_show_name")    
+    df = category_to_int(df, "conn_country")
+    df = category_to_int(df, "ip_addr")
+    df = category_to_int(df, "album.type")    
+    df = category_to_int(df, "release_date_precision")
+    df = category_to_int(df, "explicit")    
+    df = category_to_int(df, "is_local")    
+    df = category_to_int(df, "is_playable")
+    df = category_to_int(df, "type")
+    df = category_to_int(df, "language")
+    df = category_to_int(df, "show.media_type")
+
 
     # Feature engineering
-    df = add_engineered_features(df)
+    df, platafromas = add_engineered_features(df)
     df = add_user_daytime_counts(df)
 
     # Create target/test
     print("Creating 'target' and 'is_test' columns...")
     df["target"] = (df["reason_end"] == "fwdbtn").astype(int)
     df["is_test"] = df["reason_end"].isna()
+ 
     df.drop(columns=["reason_end"], inplace=True)
     print("  → 'target' and 'is_test' created, dropped 'reason_end' column.")
 
@@ -234,33 +427,39 @@ def main():
     df = add_skip_history(df)
 
     # Columns to keep
+
+    df = df.sort_values(["obs_id"])
     to_keep = [
-        "obs_id", "int_platform", "int_platform_os", "int_time_of_day",
-        "int_master_metadata_track_name", "int_master_metadata_album_artist_name",
-        "int_master_metadata_album_album_name", "target", "is_test",
-        "shuffle", "offline", "incognito_mode", "int_username",
+        "obs_id", "int_time_of_day",
+        "int_username", *platafromas, "int_conn_country", "int_episode_name",
+        "int_master_metadata_track_name", "int_master_metadata_album_artist_name", "target", "is_test",
+        "shuffle", "offline", "incognito_mode", 
         "count_morning", "count_noon", "count_afternoon", "count_night",
         "day_of_week", "hour",
         "ts_diff", "session_pos", "session_len",
-        "user_track_count", "user_artist_count", "user_skip_rate"
+        "user_track_count", "user_artist_count", "is_weekend", 
+        "disc_number", "int_explicit","int_is_local", "int_is_playable", 
+        "popularity", "track_number", "duration_ms", "int_album.type", "int_release_date_precision",
+        "int_type", "album.total_tracks", "int_language", "int_show.media_type", 
     ]
     df = df[to_keep]
 
     # Split
     X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
 
+  
     # Train model
     print("Training XGBoosting model...")
     params = {
-        "max_depth": list(range(3, 10)),
-        "learning_rate": uniform(0.01, 0.2),
-        "subsample": uniform(0.5, 0.5),        # <= más bajo, más robusto
-        "colsample_bytree": uniform(0.5, 0.5), # <= más bajo, más robusto
-        "min_child_weight": randint(5, 20),    # evita sobreajuste a outliers
-        "gamma": uniform(0, 5),
-        "reg_lambda": uniform(5, 20),          # más regularización L2
-        "reg_alpha": uniform(0, 5),            # agregá regularización L1
-        "n_estimators": list(range(200, 1001, 100))
+        "max_depth": hp.uniform("max_depth", 3, 10),
+        "learning_rate": hp.uniform("learning_rate", 0.01, 0.2),
+        "subsample": hp.uniform("subsample", 0.5, 0.8),        # <= más bajo, más robusto
+        "colsample_bytree": hp.uniform("colsample_bytree",0.5, 1.0), # <= más bajo, más robusto
+        "min_child_weight": hp.uniform('min_child_weight', 5, 15),    # evita sobreajuste a outliers
+        "gamma": hp.uniform("gamma",2.0, 7.0),
+        "reg_lambda": hp.uniform('reg_lambda', 5.0, 20.0),          # más regularización L2
+        "reg_alpha": hp.uniform("reg_alpha", 0.0, 5.0),            # agregá regularización L1
+        "n_estimators": hp.uniform("n_estimators", 100, 800)
     }
     model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
@@ -288,8 +487,8 @@ def main():
     test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
-    preds_df.to_csv("modelo_masvariables2.csv", index=False)
-    print("  → Predictions written to 'modelo_masvariables.csv'")
+    preds_df.to_csv("modelo_masvariables4.csv", index=False)
+    print("  → Predictions written to 'modelo_masvariables4.csv'")
 
     print("=== Pipeline complete ===")
 

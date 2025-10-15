@@ -286,6 +286,7 @@ def split_train_valid_test(df):
     y_train = train_df["target"].to_numpy()
     X_valid = valid_df.drop(columns=["target"])
     y_valid = valid_df["target"].to_numpy()
+    test_obs_ids = test_df["obs_id"].to_numpy()
     X_test = test_df.drop(columns=["target"])
     y_test = test_df["target"].to_numpy()
 
@@ -293,7 +294,8 @@ def split_train_valid_test(df):
     print(f"→ Valid: {X_valid.shape[0]} filas")
     print(f"→ Test:  {X_test.shape[0]} filas")
 
-    return X_train, y_train, X_valid, y_valid, X_test, y_test
+    return X_train, y_train, X_valid, y_valid, X_test, y_test, test_obs_ids
+
 
 def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
     def objective(params):
@@ -322,7 +324,7 @@ def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
         fn=objective,
         space=params,
         algo=tpe.suggest,
-        max_evals=30,
+        max_evals=80,
         rstate=np.random.default_rng(1234)  # semilla reproducible
     )
     final_params = {
@@ -437,9 +439,15 @@ def main():
     df = df[to_keep]
 
     # Split
-    X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
+    X_train, y_train, X_valid, y_valid, X_test, y_test, test_obs_ids = split_train_valid_test(df)
 
-  
+    # Balance de clases
+    neg = (y_train == 0).sum()
+    pos = (y_train == 1).sum()
+    scale_pos_weight = neg / pos
+    print(f"→ scale_pos_weight = {scale_pos_weight:.2f}")
+
+    
     # Train model
     print("Training XGBoosting model...")
     params = {
@@ -453,9 +461,9 @@ def main():
         "reg_alpha": hp.uniform("reg_alpha", 0.0, 5.0),            # agregá regularización L1
         "n_estimators": hp.uniform("n_estimators", 100, 800)
     }
-    model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
-    model.fit(X_train, y_train, verbose=100, eval_set=[(X_valid, y_valid)])
+
+    model = train_classifier(X_train, y_train, X_valid, y_valid, params)
 
     print("Evaluating on training set...")
     train_pred = model.predict_proba(X_train)[:, 1]

@@ -350,7 +350,7 @@ def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
     best_model.fit(
             X_train, y_train,
             eval_set=[(X_valid, y_valid)],
-            verbose=False, early_stopping_rounds=10
+            verbose=False
         )
     y_pred = best_model.predict_proba(X_valid)[:, 1]
     best_score= roc_auc_score(y_valid, y_pred)
@@ -365,17 +365,9 @@ def main():
     print("=== Starting pipeline ===")
     df, df_t, df_s = load_competition_datasets(COMPETITION_PATH, sample_frac=1, random_state=1234, max_files=20500)
     df, df_t, df_s = cast_column_types(df, df_t, df_s)
-    df = df.sort_values(["obs_id"])
-
-    df_t = df_t.rename(columns={'name': 'master_metadata_track_name'})
-    df_s = df_s.rename(columns={'name': 'episode_name'})
-
-    print(df_t.info(memory_usage='deep'))
-    print(df_s.info(memory_usage='deep'))
-    
-    df_t = df_t.drop_duplicates(subset=["master_metadata_track_name"])
-    df_s = df_s.drop_duplicates(subset=["episode_name"])
-
+    df = df.sort_values(["obs_id"]) 
+    df_t = df_t.rename(columns={"name": "master_metadata_track_name"})
+    df_s = df_s.rename(columns={"name": "episode_name"})
 
     df = df.merge(df_t, on="master_metadata_track_name", how="left", suffixes=("", "_track"))
     df = df.merge(df_s, on="episode_name", how="left", suffixes=("", "_episode"))
@@ -484,9 +476,12 @@ def main():
 
     # Predictions
     print("Generating predictions for test set...")
-    test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
+
+    # Eliminar posibles obs_id duplicados
+    preds_df = preds_df.drop_duplicates(subset="obs_id", keep="last")
+
     preds_df.to_csv("modelo_masvariables4.csv", index=False)
     print("  → Predictions written to 'modelo_masvariables4.csv'")
 

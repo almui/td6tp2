@@ -286,7 +286,6 @@ def split_train_valid_test(df):
     y_train = train_df["target"].to_numpy()
     X_valid = valid_df.drop(columns=["target"])
     y_valid = valid_df["target"].to_numpy()
-    test_obs_ids = test_df["obs_id"].to_numpy()
     X_test = test_df.drop(columns=["target"])
     y_test = test_df["target"].to_numpy()
 
@@ -294,8 +293,7 @@ def split_train_valid_test(df):
     print(f"→ Valid: {X_valid.shape[0]} filas")
     print(f"→ Test:  {X_test.shape[0]} filas")
 
-    return X_train, y_train, X_valid, y_valid, X_test, y_test, test_obs_ids
-
+    return X_train, y_train, X_valid, y_valid, X_test, y_test
 
 def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
     def objective(params):
@@ -324,7 +322,7 @@ def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
         fn=objective,
         space=params,
         algo=tpe.suggest,
-        max_evals=80,
+        max_evals=30,
         rstate=np.random.default_rng(1234)  # semilla reproducible
     )
     final_params = {
@@ -367,9 +365,17 @@ def main():
     print("=== Starting pipeline ===")
     df, df_t, df_s = load_competition_datasets(COMPETITION_PATH, sample_frac=1, random_state=1234, max_files=20500)
     df, df_t, df_s = cast_column_types(df, df_t, df_s)
-    df = df.sort_values(["obs_id"]) 
-    df_t = df_t.rename(columns={"name": "master_metadata_track_name"})
-    df_s = df_s.rename(columns={"name": "episode_name"})
+    df = df.sort_values(["obs_id"])
+
+    df_t = df_t.rename(columns={'name': 'master_metadata_track_name'})
+    df_s = df_s.rename(columns={'name': 'episode_name'})
+
+    print(df_t.info(memory_usage='deep'))
+    print(df_s.info(memory_usage='deep'))
+    
+    df_t = df_t.drop_duplicates(subset=["master_metadata_track_name"])
+    df_s = df_s.drop_duplicates(subset=["episode_name"])
+
 
     df = df.merge(df_t, on="master_metadata_track_name", how="left", suffixes=("", "_track"))
     df = df.merge(df_s, on="episode_name", how="left", suffixes=("", "_episode"))
@@ -439,15 +445,9 @@ def main():
     df = df[to_keep]
 
     # Split
-    X_train, y_train, X_valid, y_valid, X_test, y_test, test_obs_ids = split_train_valid_test(df)
+    X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
 
-    # Balance de clases
-    neg = (y_train == 0).sum()
-    pos = (y_train == 1).sum()
-    scale_pos_weight = neg / pos
-    print(f"→ scale_pos_weight = {scale_pos_weight:.2f}")
-
-    
+  
     # Train model
     print("Training XGBoosting model...")
     params = {
@@ -461,9 +461,9 @@ def main():
         "reg_alpha": hp.uniform("reg_alpha", 0.0, 5.0),            # agregá regularización L1
         "n_estimators": hp.uniform("n_estimators", 100, 800)
     }
-
-
     model = train_classifier(X_train, y_train, X_valid, y_valid, params)
+
+    model.fit(X_train, y_train, verbose=100, eval_set=[(X_valid, y_valid)])
 
     print("Evaluating on training set...")
     train_pred = model.predict_proba(X_train)[:, 1]
@@ -484,12 +484,9 @@ def main():
 
     # Predictions
     print("Generating predictions for test set...")
+    test_obs_ids = X_test["obs_id"]
     preds_proba = model.predict_proba(X_test)[:, 1]
     preds_df = pd.DataFrame({"obs_id": test_obs_ids, "pred_proba": preds_proba})
-
-    # Eliminar posibles obs_id duplicados
-    preds_df = preds_df.drop_duplicates(subset="obs_id", keep="last")
-
     preds_df.to_csv("modelo_masvariables4.csv", index=False)
     print("  → Predictions written to 'modelo_masvariables4.csv'")
 

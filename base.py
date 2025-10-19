@@ -162,9 +162,27 @@ def cast_column_types(df, df_t, df_e):
         if col in df_e.columns:
             df_e[col] = df_e[col].astype(dtype)
     print("  → Column types cast successfully.")
-
     return df, df_t, df_e
 
+def mergeAPIs(df, df_t, df_s):
+    df_t = df_t.rename(columns={'name': 'master_metadata_track_name'}) #renombro las columnas para que tengan las mismas que el dataset
+    df_s = df_s.rename(columns={'name': 'episode_name'})
+
+    
+    df_t = df_t.drop_duplicates(subset=["master_metadata_track_name"])
+    df_s = df_s.drop_duplicates(subset=["episode_name"])
+
+
+    df = df.merge(df_t, on="master_metadata_track_name", how="left", suffixes=("", "_track"))
+    df = df.merge(df_s, on="episode_name", how="left", suffixes=("", "_episode"))
+    for col in ["explicit", "duration_ms"]: # ponemos las columnas de explicit de los dos dataset de las APIs como una columna en nuestro df final. 
+        track_col = f"{col}_track"
+        episode_col = f"{col}_episode"# ponemos las columnas de duration_ms de los dos dataset de las APIs como una columna en nuestro df final.
+        if track_col in df.columns or episode_col in df.columns:
+            df[col] = df.get(track_col, df.get(episode_col))
+            df[col] = df[col].combine_first(df.get(episode_col))
+        df = df.drop(columns=[c for c in [track_col, episode_col] if c in df.columns])
+    return df
 # =========================
 # Feature Engineering
 # =========================
@@ -226,7 +244,7 @@ def add_engineered_features(df):
 
 def add_user_daytime_counts(df):
     user_day_counts = (
-        df.groupby(["username", "time_of_day"]).size().reset_index(name="count")
+        df.groupby(["username", "time_of_day"], observed=False).size().reset_index(name="count")
     )
     user_day_counts = user_day_counts.pivot(
         index="username", columns="time_of_day", values="count"
@@ -237,36 +255,22 @@ def add_user_daytime_counts(df):
 
 def add_session_features(df):
     df = df.sort_values(["username", "ts"])
-    df["ts_diff"] = df.groupby("username")["ts"].diff().dt.total_seconds().fillna(0)
+    df["ts_diff"] = df.groupby("username", observed=False)["ts"].diff().dt.total_seconds().fillna(0)
     df["new_session"] = (df["ts_diff"] > 1800).astype(int)
-    df["session_id"] = df.groupby("username")["new_session"].cumsum()
-    df["session_pos"] = df.groupby(["username", "session_id"]).cumcount() + 1
-    df["session_len"] = df.groupby(["username", "session_id"])["obs_id"].transform("count")
+    df["session_id"] = df.groupby("username", observed=False)["new_session"].cumsum()
+    df["session_pos"] = df.groupby(["username", "session_id"], observed=False).cumcount() + 1
+    df["session_len"] = df.groupby(["username", "session_id"], observed=False)["obs_id"].transform("count")
+
     return df
 
 def add_repetition_features(df):
     df = df.sort_values(["username", "ts"])
-    df["user_track_count"] = df.groupby(["username", "int_master_metadata_track_name"]).cumcount()
-    df["user_artist_count"] = df.groupby(["username", "int_master_metadata_album_artist_name"]).cumcount()
+    df["user_track_count"] = df.groupby(["username", "int_master_metadata_track_name"], observed=False).cumcount()
+    df["user_artist_count"] = df.groupby(["username", "int_master_metadata_album_artist_name"], observed=False).cumcount()
+    df = df.sort_values(["obs_id"])
     return df
 
-def add_skip_history(df: pd.DataFrame) -> pd.DataFrame:
-    # User’s rolling skip rate up to the current observation
-    df["user_skip_rate"] = (
-        df.groupby("username")["target"]
-          .transform(lambda x: x.shift().expanding().mean())
-    )
-    
-    # Fill NaN for first observation
-    df["user_skip_rate"] = df["user_skip_rate"].fillna(0.0)
 
-    # Recent skip streak: last N plays skipped (e.g., 3)
-    df["user_recent_skip_sum"] = (
-        df.groupby("username")["target"]
-          .transform(lambda x: x.shift().rolling(3, min_periods=1).sum())
-    )
-
-    return df
 
 # =========================
 # Train / Eval
@@ -287,15 +291,14 @@ def split_train_valid_test(df):
     X_valid = valid_df.drop(columns=["target"])
     y_valid = valid_df["target"].to_numpy()
     X_test = test_df.drop(columns=["target"])
-    y_test = test_df["target"].to_numpy()
 
     print(f"→ Train: {X_train.shape[0]} filas")
     print(f"→ Valid: {X_valid.shape[0]} filas")
     print(f"→ Test:  {X_test.shape[0]} filas")
 
-    return X_train, y_train, X_valid, y_valid, X_test, y_test
+    return X_train, y_train, X_valid, y_valid, X_test
 
-def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
+def train_classifier(X_train, y_train, X_valid, y_valid,n, params=None):
     def objective(params):
         # Convertir a enteros si es necesario
         params['max_depth'] = int(params['max_depth'])
@@ -322,7 +325,7 @@ def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
         fn=objective,
         space=params,
         algo=tpe.suggest,
-        max_evals=30,
+        max_evals=n,
         rstate=np.random.default_rng(1234)  # semilla reproducible
     )
     final_params = {
@@ -357,6 +360,9 @@ def train_classifier(X_train, y_train, X_valid, y_valid, params=None):
     print('ROC-AUC: %0.5f' % best_score)
     return best_model
 
+
+
+
 # =========================
 # Main
 # =========================
@@ -366,52 +372,42 @@ def main():
     df, df_t, df_s = load_competition_datasets(COMPETITION_PATH, sample_frac=1, random_state=1234, max_files=20500)
     df, df_t, df_s = cast_column_types(df, df_t, df_s)
     df = df.sort_values(["obs_id"])
-
-    df_t = df_t.rename(columns={'name': 'master_metadata_track_name'})
-    df_s = df_s.rename(columns={'name': 'episode_name'})
-
-    print(df_t.info(memory_usage='deep'))
-    print(df_s.info(memory_usage='deep'))
-    
-    df_t = df_t.drop_duplicates(subset=["master_metadata_track_name"])
-    df_s = df_s.drop_duplicates(subset=["episode_name"])
-
-
-    df = df.merge(df_t, on="master_metadata_track_name", how="left", suffixes=("", "_track"))
-    df = df.merge(df_s, on="episode_name", how="left", suffixes=("", "_episode"))
-    for col in ["explicit", "duration_ms"]:
-        track_col = f"{col}_track"
-        episode_col = f"{col}_episode"
-        if track_col in df.columns or episode_col in df.columns:
-            df[col] = df.get(track_col, df.get(episode_col))
-            df[col] = df[col].combine_first(df.get(episode_col))
-        df = df.drop(columns=[c for c in [track_col, episode_col] if c in df.columns])
-    
-
+    df = mergeAPIs(df, df_t, df_s)
+    print("From our dataset the missing values are:")
+    print(df.isnull().sum())
 
     # Basic encodings
-    df = category_to_int(df, "master_metadata_album_album_name")
-    df = category_to_int(df, "master_metadata_album_artist_name")
-    df = category_to_int(df, "master_metadata_track_name")
-    df = category_to_int(df, "platform")
-    df = category_to_int(df, "username")
-    df = category_to_int(df, "episode_name")
-    df = category_to_int(df, "episode_show_name")    
-    df = category_to_int(df, "conn_country")
-    df = category_to_int(df, "ip_addr")
-    df = category_to_int(df, "album.type")    
-    df = category_to_int(df, "release_date_precision")
-    df = category_to_int(df, "explicit")    
-    df = category_to_int(df, "is_local")    
-    df = category_to_int(df, "is_playable")
-    df = category_to_int(df, "type")
-    df = category_to_int(df, "language")
-    df = category_to_int(df, "show.media_type")
+    print("Encoding our categorical variables into numeric variables...")
+    cols_to_encode = [
+        "master_metadata_album_album_name",
+        "master_metadata_album_artist_name",
+        "master_metadata_track_name",
+        "platform",
+        "username",
+        "episode_name",
+        "episode_show_name",
+        "conn_country",
+        "ip_addr",
+        "album.type",
+        "release_date_precision",
+        "explicit",
+        "is_local",
+        "is_playable",
+        "type",
+        "language",
+        "show.media_type"
+    ]
 
+    for col in cols_to_encode:
+        df = category_to_int(df, col)
+
+    print(f"  → Encoded {len(cols_to_encode)} categorical columns into numeric values.")
 
     # Feature engineering
-    df, platafromas = add_engineered_features(df)
+    print("Creating new columns...")
+    df, plataformas = add_engineered_features(df)
     df = add_user_daytime_counts(df)
+    print("  → New feature columns successfully created and merged.")
 
     # Create target/test
     print("Creating 'target' and 'is_test' columns...")
@@ -424,14 +420,14 @@ def main():
     # Session + repetition + temporal + skip history
     df = add_session_features(df)
     df = add_repetition_features(df)
-    df = add_skip_history(df)
+
 
     # Columns to keep
 
     df = df.sort_values(["obs_id"])
     to_keep = [
         "obs_id", "int_time_of_day",
-        "int_username", *platafromas, "int_conn_country", "int_episode_name",
+        "int_username", *plataformas, "int_conn_country", "int_episode_name",
         "int_master_metadata_track_name", "int_master_metadata_album_artist_name", "target", "is_test",
         "shuffle", "offline", "incognito_mode", 
         "count_morning", "count_noon", "count_afternoon", "count_night",
@@ -445,7 +441,7 @@ def main():
     df = df[to_keep]
 
     # Split
-    X_train, y_train, X_valid, y_valid, X_test, y_test = split_train_valid_test(df)
+    X_train, y_train, X_valid, y_valid, X_test = split_train_valid_test(df)
 
   
     # Train model
@@ -461,7 +457,7 @@ def main():
         "reg_alpha": hp.uniform("reg_alpha", 0.0, 5.0),            # agregá regularización L1
         "n_estimators": hp.uniform("n_estimators", 100, 800)
     }
-    model = train_classifier(X_train, y_train, X_valid, y_valid, params)
+    model = train_classifier(X_train, y_train, X_valid, y_valid, 30, params)
 
     model.fit(X_train, y_train, verbose=100, eval_set=[(X_valid, y_valid)])
 
